@@ -1,0 +1,162 @@
+From: VIKINGYFY <viking.yfy@qq.com>
+Date: Tue, 13 Oct 2026 19:06:36 +0800
+Subject: [PATCH] gc: add scheduled cleanup switch and validate configuration
+
+Expose gc.enabled so LuCI can disable automatic maintenance while leaving
+manual cleanup available. Register no scheduled GC task when disabled.
+
+Use the configuration loaded at startup for batch size and timeout,
+validate it when constructing the worker, and remove runtime default-value
+fallbacks. Update the existing GC fixtures to provide explicit settings.
+
+Base-Commit: 0896305eeee89435049575d55a813f72901f703b
+
+---
+
+--- a/conf/conf.go
++++ b/conf/conf.go
+@@ -331,4 +331,5 @@ func setDefaults(v *viper.Viper) {
+ 
+ 	// GC defaults
++	v.SetDefault("gc.enabled", true)
+ 	v.SetDefault("gc.cron", "0 2 * * *") // Daily at 2:00 AM
+ 	v.SetDefault("gc.vacuum_enabled", true)
+--- a/config.example.yml
++++ b/config.example.yml
+@@ -176,4 +176,6 @@ metrics:
+ # Garbage Collection configuration
+ gc:
++  enabled: true                  # Enable scheduled cleanup (env: AXONHUB_GC_ENABLED)
++                                 # Manual cleanup remains available when disabled
+   cron: "0 2 * * *"              # Cron expression for GC execution (env: AXONHUB_GC_CRON)
+                                  # This example runs daily at 2:00 AM
+--- a/internal/server/gc/gc.go
++++ b/internal/server/gc/gc.go
+@@ -27,6 +27,4 @@ import (
+ )
+ 
+-var defaultBatchSize = 500
+-
+ var ErrCleanupInProgress = errors.New("cleanup already running")
+ 
+@@ -47,5 +45,6 @@ type GcCleanupPreviewItem struct {
+ 
+ type Config struct {
+-	BatchSize     int           `json:"batch_size" yaml:"batch_size" conf:"batch_size" validate:"gte=0,lte=10000"`
++	Enabled       bool          `json:"enabled" yaml:"enabled" conf:"enabled"`
++	BatchSize     int           `json:"batch_size" yaml:"batch_size" conf:"batch_size" validate:"gt=0,lte=10000"`
+ 	BatchInterval time.Duration `json:"batch_interval" yaml:"batch_interval" conf:"batch_interval" validate:"gte=0"`
+ 	Timeout       time.Duration `json:"timeout" yaml:"timeout" conf:"timeout" validate:"gt=0"`
+@@ -73,5 +72,11 @@ type Params struct {
+ }
+ 
+-func NewWorker(params Params) *Worker {
++func NewWorker(params Params) (*Worker, error) {
++	if params.Config.BatchSize <= 0 || params.Config.BatchSize > 10000 {
++		return nil, fmt.Errorf("gc.batch_size must be between 1 and 10000")
++	}
++	if params.Config.Timeout <= 0 || params.Config.BatchInterval < 0 {
++		return nil, fmt.Errorf("gc.timeout must be positive and gc.batch_interval must be non-negative")
++	}
+ 	w := &Worker{
+ 		SystemService:      params.SystemService,
+@@ -81,8 +86,12 @@ func NewWorker(params Params) *Worker {
+ 	}
+ 
+-	return w
++	return w, nil
+ }
+ 
+ func (w *Worker) RegisterScheduledTasks(ctx context.Context, s *scheduler.Scheduler) error {
++	if !w.Config.Enabled {
++		log.Info(ctx, "Scheduled request history cleanup is disabled")
++		return nil
++	}
+ 	return s.RegisterWithError(ctx, scheduler.TaskSpec{
+ 		Name:        "gc",
+@@ -119,8 +128,5 @@ func (w *Worker) deleteInBatches(ctx con
+ // getBatchSize returns the appropriate batch size for cleanup operations.
+ func (w *Worker) getBatchSize() int {
+-	if w.Config.BatchSize > 0 {
+-		return w.Config.BatchSize
+-	}
+-	return defaultBatchSize
++	return w.Config.BatchSize
+ }
+ 
+@@ -156,9 +162,5 @@ func (w *Worker) runCleanup(ctx context.
+ 
+ func (w *Worker) runCleanupLocked(ctx context.Context, manual bool, manualDays map[string]int) (result error) {
+-	timeout := w.Config.Timeout
+-	if timeout <= 0 {
+-		timeout = 10 * time.Minute
+-	}
+-	ctx, cancel := context.WithTimeout(ctx, timeout)
++	ctx, cancel := context.WithTimeout(ctx, w.Config.Timeout)
+ 	defer cancel()
+ 	started := time.Now()
+--- a/internal/server/gc/gc_bodies_test.go
++++ b/internal/server/gc/gc_bodies_test.go
+@@ -239,4 +239,5 @@ func setupBodyCleanupWorker(t *testing.T
+ 
+ 	worker := &Worker{
++		Config:             Config{BatchSize: 500, Timeout: 10 * time.Minute, Enabled: true},
+ 		SystemService:      systemService,
+ 		DataStorageService: dataStorageService,
+@@ -579,4 +580,5 @@ func TestCleanupRequestBodies_PostgresIm
+ 
+ 	worker := &Worker{
++		Config:             Config{BatchSize: 500, Timeout: 10 * time.Minute, Enabled: true},
+ 		SystemService:      systemService,
+ 		DataStorageService: dataStorageService,
+--- a/internal/server/gc/gc_test.go
++++ b/internal/server/gc/gc_test.go
+@@ -24,25 +24,8 @@ import (
+ 
+ func TestWorker_getBatchSize(t *testing.T) {
+-	worker := &Worker{
+-		Ent:    nil,
+-		Config: Config{CRON: "0 0 * * *"},
+-	}
+-
+-	// Test default batch size
+-	batchSize := worker.getBatchSize()
+-	if batchSize != defaultBatchSize {
+-		t.Errorf("Expected batch size %d, got %d", defaultBatchSize, batchSize)
+-	}
+-
+-	// Test with overridden batch size
+-	originalBatchSize := defaultBatchSize
+-	defaultBatchSize = 20
+-
+-	defer func() { defaultBatchSize = originalBatchSize }()
+-
+-	batchSize = worker.getBatchSize()
+-	if batchSize != 20 {
+-		t.Errorf("Expected batch size 20, got %d", batchSize)
+-	}
++	worker := &Worker{Config: Config{BatchSize: 500}}
++	require.Equal(t, 500, worker.getBatchSize())
++	worker.Config.BatchSize = 20
++	require.Equal(t, 20, worker.getBatchSize())
+ }
+ 
+@@ -199,4 +182,5 @@ func setupWorkerWithFSStorage(t *testing
+ 
+ 	worker := &Worker{
++		Config:             Config{BatchSize: 500, Timeout: 10 * time.Minute, Enabled: true},
+ 		SystemService:      systemService,
+ 		DataStorageService: dataStorageService,
+@@ -302,11 +286,5 @@ func TestWorker_cleanupChannelProbesDele
+ 	ctx = ent.NewContext(ctx, client)
+ 
+-	originalBatchSize := defaultBatchSize
+-	defaultBatchSize = 2
+-	t.Cleanup(func() {
+-		defaultBatchSize = originalBatchSize
+-	})
+-
+-	worker := &Worker{Ent: client, Config: Config{CRON: "0 0 * * *"}}
++	worker := &Worker{Ent: client, Config: Config{CRON: "0 0 * * *", BatchSize: 2}}
+ 	oldTimestamp := time.Now().AddDate(0, 0, -5).Unix()
+ 	recentTimestamp := time.Now().Unix()
